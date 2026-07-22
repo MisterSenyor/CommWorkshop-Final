@@ -1,0 +1,8 @@
+build/
+.vscode/ipch/
+*.o
+*.a
+*.so
+*.dylib
+*.exe
+.DS_Store
