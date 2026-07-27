@@ -5,19 +5,21 @@
 #include <stdexcept>
 #include <arpa/inet.h>
 
-/* Helper to safely retrieve VerbsTransport instance from C handle state pointer */
+/* Helper to safely retrieve VerbsTransport instance from C handle implementation pointer */
 static VerbsTransport* get_impl(pg_transport_t* transport) {
-    if (!transport || !transport->state) return nullptr;
-    return static_cast<VerbsTransport*>(transport->state);
+    if (!transport || !transport->implementation) return nullptr;
+    return static_cast<VerbsTransport*>(transport->implementation);
 }
 
 static int verbs_rank(const pg_transport_t* transport) {
-    auto* self = static_cast<const VerbsTransport*>(transport->state);
+    if (!transport || !transport->implementation) return -1;
+    auto* self = static_cast<const VerbsTransport*>(transport->implementation);
     return self ? self->get_rank() : -1;
 }
 
 static int verbs_size(const pg_transport_t* transport) {
-    auto* self = static_cast<const VerbsTransport*>(transport->state);
+    if (!transport || !transport->implementation) return -1;
+    auto* self = static_cast<const VerbsTransport*>(transport->implementation);
     return self ? self->get_world_size() : -1;
 }
 
@@ -31,20 +33,14 @@ static int verbs_post_send_next(pg_transport_t* transport, const void* buf, size
     if (!self) return -1;
 
     try {
-        // Register memory region for the outgoing buffer slice
-        struct ibv_mr* mr = self->register_memory(const_cast<void*>(buf), bytes);
-
         // Send via RDMA Write with Immediate (tag is sent as imm_data)
         self->post_rdma_write_imm(
             const_cast<void*>(buf), 
             bytes, 
-            mr, 
+            nullptr, 
             0, 
             static_cast<uint32_t>(tag)
         );
-
-        // Unregister memory after posting WR
-        self->unregister_memory(mr);
         return 0;
     } catch (const std::exception& e) {
         std::cerr << "[VerbsTransport] Error in post_send_next: " << e.what() << std::endl;
@@ -54,15 +50,22 @@ static int verbs_post_send_next(pg_transport_t* transport, const void* buf, size
 
 static int verbs_post_recv_prev(pg_transport_t* transport, void* buf, size_t bytes, 
                                 pg_tag_t tag, pg_transfer_mode_t mode, pg_request_t* req) {
-    (void)transport;
     (void)buf;
     (void)bytes;
     (void)tag;
     (void)mode;
     (void)req;
-    // For RDMA Writes, incoming data is written directly into destination memory by the sender's NIC.
-    // No explicit receive Work Request (WR) needs to be posted on the receiver side.
-    return 0;
+    VerbsTransport* self = get_impl(transport);
+    if (!self) return -1;
+
+    try {
+        // Post a receive Work Request to qp_prev_ to catch the incoming immediate notification
+        self->post_recv_imm();
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "[VerbsTransport] Error in post_recv_prev: " << e.what() << std::endl;
+        return -1;
+    }
 }
 
 static int verbs_wait(pg_transport_t* transport, pg_request_t* req) {
@@ -95,16 +98,16 @@ VerbsTransport::VerbsTransport(int rank, int world_size, struct ibv_context* con
 
     // Configure operations table for C-style pg_transport_t interface
     std::memset(&c_ops_, 0, sizeof(c_ops_));
+    c_ops_.rank = verbs_rank;
+    c_ops_.size = verbs_size;
     c_ops_.post_send_next = verbs_post_send_next;
     c_ops_.post_recv_prev = verbs_post_recv_prev;
     c_ops_.wait = verbs_wait;
 
     // Bind transport instance references to C-style wrapper struct
     std::memset(&c_transport_, 0, sizeof(c_transport_));
-    c_transport_.ops = &c_ops_;
-    c_transport_.state = this;
-    c_transport_.rank = verbs_rank;
-    c_transport_.size = verbs_size;
+    c_transport_.implementation = this;
+    c_transport_.operations = &c_ops_;
 }
 
 /* Destructor - Cleans up the Completion Queue (CQ) and any other resources allocated by the VerbsTransport. */
@@ -145,9 +148,26 @@ void VerbsTransport::set_remote_mr_next(const RemoteMR& remote_mr) {
     remote_mr_next_ = remote_mr;
 }
 
+/* Posts a Receive Work Request on the previous Queue Pair to consume the incoming immediate data. */
+void VerbsTransport::post_recv_imm() {
+    assert(qp_prev_ != nullptr && "qp_prev must be configured before posting Recv");
+
+    struct ibv_recv_wr wr;
+    std::memset(&wr, 0, sizeof(wr));
+    wr.wr_id = 2; // Arbitrary receive WR ID
+    wr.sg_list = nullptr;
+    wr.num_sge = 0;
+
+    struct ibv_recv_wr* bad_wr = nullptr;
+    int ret = ibv_post_recv(qp_prev_, &wr, &bad_wr);
+    if (ret != 0) {
+        throw std::runtime_error("ibv_post_recv failed with error code: " + std::to_string(ret));
+    }
+}
+
 /* Posts an RDMA Write with Immediate operation to the next node in the ring. The local buffer is written to the remote buffer, and an immediate value is sent to signal completion. */
 void VerbsTransport::post_rdma_write_imm(void* local_addr, size_t length, struct ibv_mr* local_mr,
-                                         uint64_t remote_offset, uint32_t imm_data) {
+                                          uint64_t remote_offset, uint32_t imm_data) {
 
     // Ensure that the next Queue Pair (QP) is configured before posting the RDMA Write operation
     assert(qp_next_ != nullptr && "qp_next must be configured before posting RDMA Write");
@@ -157,7 +177,7 @@ void VerbsTransport::post_rdma_write_imm(void* local_addr, size_t length, struct
     std::memset(&sge, 0, sizeof(sge));
     sge.addr = reinterpret_cast<uint64_t>(local_addr);
     sge.length = static_cast<uint32_t>(length);
-    sge.lkey = local_mr->lkey;
+    sge.lkey = local_mr ? local_mr->lkey : 0;
 
     // Prepare the Work Request (WR) for the RDMA Write with Immediate operation
     struct ibv_send_wr wr;

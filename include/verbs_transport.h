@@ -31,6 +31,8 @@ public:
     void post_rdma_write_imm(void* local_addr, size_t length, struct ibv_mr* local_mr,
                              uint64_t remote_offset, uint32_t imm_data);
 
+    void post_recv_imm();
+
     uint32_t poll_completion_imm();
 
     // Returns a C-style transport structure for interoperability with C code.
