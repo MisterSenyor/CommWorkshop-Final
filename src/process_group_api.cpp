@@ -4,6 +4,7 @@
 #include <new>
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -91,57 +92,51 @@ namespace {
         return ibv_create_qp(pd, &qp_init_attr);
     }
 
-    /* Helper function to perform socket handshake and exchange QP parameters with a neighbor */
-    int socket_exchange(const char* host, int port, const ExchangeData& local, ExchangeData& remote, bool is_server) {
-        int sock = -1;
-        if (is_server) {
-            int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-            if (listen_fd < 0) return -1;
-            int opt = 1;
-            setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            
-            struct sockaddr_in serv_addr;
-            std::memset(&serv_addr, 0, sizeof(serv_addr));
-            serv_addr.sin_family = AF_INET;
-            serv_addr.sin_addr.s_addr = INADDR_ANY;
-            serv_addr.sin_port = htons(port);
+    /* Server socket listener to accept connection from previous neighbor */
+    int listen_and_accept(int port) {
+        int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd < 0) return -1;
 
-            if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0 ||
-                listen(listen_fd, 1) < 0) {
-                close(listen_fd);
-                return -1;
-            }
-            sock = accept(listen_fd, nullptr, nullptr);
+        int opt = 1;
+        setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+        struct sockaddr_in serv_addr;
+        std::memset(&serv_addr, 0, sizeof(serv_addr));
+        serv_addr.sin_family = AF_INET;
+        serv_addr.sin_addr.s_addr = INADDR_ANY;
+        serv_addr.sin_port = htons(port);
+
+        if (bind(listen_fd, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0 ||
+            listen(listen_fd, 1) < 0) {
             close(listen_fd);
-        } else {
-            struct addrinfo hints{}, *res = nullptr;
-            hints.ai_family = AF_INET;
-            hints.ai_socktype = SOCK_STREAM;
-            std::string port_str = std::to_string(port);
-            
-            if (getaddrinfo(host, port_str.c_str(), &hints, &res) != 0) return -1;
-            
-            for (int i = 0; i < 30; ++i) { // Retry connection while server starts up
-                sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-                if (sock >= 0 && connect(sock, res->ai_addr, res->ai_addrlen) == 0) break;
-                if (sock >= 0) close(sock);
-                sock = -1;
-                usleep(100000);
-            }
-            freeaddrinfo(res);
-        }
-
-        if (sock < 0) return -1;
-
-        // Exchange data structures
-        if (write(sock, &local, sizeof(local)) != sizeof(local) ||
-            read(sock, &remote, sizeof(remote)) != sizeof(remote)) {
-            close(sock);
             return -1;
         }
 
-        close(sock);
-        return 0;
+        int conn_fd = accept(listen_fd, nullptr, nullptr);
+        close(listen_fd);
+        return conn_fd;
+    }
+
+    /* Client socket to connect to next neighbor */
+    int connect_to_host(const char* host, int port) {
+        struct addrinfo hints{}, *res = nullptr;
+        hints.ai_family = AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+        std::string port_str = std::to_string(port);
+
+        if (getaddrinfo(host, port_str.c_str(), &hints, &res) != 0) return -1;
+
+        int sock = -1;
+        for (int i = 0; i < 50; ++i) { // Retry while server node starts up
+            sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+            if (sock >= 0 && connect(sock, res->ai_addr, res->ai_addrlen) == 0) break;
+            if (sock >= 0) close(sock);
+            sock = -1;
+            usleep(100000);
+        }
+
+        freeaddrinfo(res);
+        return sock;
     }
 
 } // namespace
@@ -180,8 +175,11 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
             return PG_ERR_TRANSPORT;
         }
 
+        // Parse environment/arguments for rank and world size
         int rank = 0;
         int world_size = 4;
+        if (const char* env_rank = std::getenv("RANK")) rank = std::atoi(env_rank);
+        if (const char* env_size = std::getenv("WORLD_SIZE")) world_size = std::atoi(env_size);
 
         // 2. Create VerbsTransport instance for RDMA communication
         VerbsTransport* verbs_transport = new (std::nothrow) VerbsTransport(rank, world_size, context, pd);
@@ -191,31 +189,60 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
             return PG_ERR_NO_MEMORY;
         }
 
+        // Create dummy registered region to obtain initial remote memory metadata
+        uint64_t dummy_buf[64];
+        struct ibv_mr* base_mr = verbs_transport->register_memory(dummy_buf, sizeof(dummy_buf));
+
         // 3. Create Queue Pairs for ring neighbors
         struct ibv_qp* qp_next = create_qp(pd, nullptr);
         struct ibv_qp* qp_prev = create_qp(pd, nullptr);
         if (!qp_next || !qp_prev) {
+            verbs_transport->unregister_memory(base_mr);
             delete verbs_transport;
             return PG_ERR_TRANSPORT;
         }
 
-        // Prepare local endpoint info
-        ExchangeData local_data_next{qp_next->qp_num, port_attr.lid, 0, 0};
-        ExchangeData local_data_prev{qp_prev->qp_num, port_attr.lid, 0, 0};
-        ExchangeData remote_data_next{}, remote_data_prev{};
+        // 4. Exchange connection info with next and previous ring neighbors via TCP Sockets
+        ExchangeData local_next{qp_next->qp_num, port_attr.lid, reinterpret_cast<uint64_t>(dummy_buf), base_mr->rkey};
+        ExchangeData local_prev{qp_prev->qp_num, port_attr.lid, reinterpret_cast<uint64_t>(dummy_buf), base_mr->rkey};
+        ExchangeData remote_next{}, remote_prev{};
 
-        // Perform socket exchange with next and previous neighbors
-        if (socket_exchange(servername, 12345 + rank, local_data_next, remote_data_next, false) != 0 ||
-            socket_exchange(nullptr, 12345 + ((rank - 1 + world_size) % world_size), local_data_prev, remote_data_prev, true) != 0) {
+        int base_port = 18000;
+        int next_sock = -1, prev_sock = -1;
+
+        // Symmetric ring connection sequence based on rank parity to prevent socket deadlocks
+        if (rank % 2 == 0) {
+            next_sock = connect_to_host(servername ? servername : "localhost", base_port + rank);
+            prev_sock = listen_and_accept(base_port + ((rank - 1 + world_size) % world_size));
+        } else {
+            prev_sock = listen_and_accept(base_port + ((rank - 1 + world_size) % world_size));
+            next_sock = connect_to_host(servername ? servername : "localhost", base_port + rank);
+        }
+
+        if (next_sock < 0 || prev_sock < 0) {
+            if (next_sock >= 0) close(next_sock);
+            if (prev_sock >= 0) close(prev_sock);
+            verbs_transport->unregister_memory(base_mr);
             ibv_destroy_qp(qp_next);
             ibv_destroy_qp(qp_prev);
             delete verbs_transport;
             return PG_ERR_TRANSPORT;
         }
 
-        // 4. Transition QPs to Ready to Send (RTS)
-        if (transition_qp_to_rts(qp_next, remote_data_next.qpn, remote_data_next.lid) != 0 ||
-            transition_qp_to_rts(qp_prev, remote_data_prev.qpn, remote_data_prev.lid) != 0) {
+        // Perform bidirection struct transfers
+        write(next_sock, &local_next, sizeof(local_next));
+        read(next_sock, &remote_next, sizeof(remote_next));
+
+        write(prev_sock, &local_prev, sizeof(local_prev));
+        read(prev_sock, &remote_prev, sizeof(remote_prev));
+
+        close(next_sock);
+        close(prev_sock);
+
+        // 5. Transition QPs to Ready to Send (RTS) and store in VerbsTransport
+        if (transition_qp_to_rts(qp_next, remote_next.qpn, remote_next.lid) != 0 ||
+            transition_qp_to_rts(qp_prev, remote_prev.qpn, remote_prev.lid) != 0) {
+            verbs_transport->unregister_memory(base_mr);
             ibv_destroy_qp(qp_next);
             ibv_destroy_qp(qp_prev);
             delete verbs_transport;
@@ -223,8 +250,10 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
         }
 
         verbs_transport->set_ring_qps(qp_next, qp_prev);
+        verbs_transport->set_remote_mr_next(RemoteMR{remote_next.vaddr, remote_next.rkey});
+        verbs_transport->unregister_memory(base_mr);
 
-        // 5. Obtain C-style transport structure and build handle
+        // 6. Obtain C-style transport structure and build process group handle
         pg_transport_t* transport = verbs_transport->get_c_transport();
         const int status = pg_create_from_transport(transport, 1, nullptr, pg_handle);
         if (status != PG_SUCCESS) {
