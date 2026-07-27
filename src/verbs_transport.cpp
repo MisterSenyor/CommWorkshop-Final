@@ -2,13 +2,33 @@
 #include <iostream>
 #include <cstring>
 #include <cassert>
+#include <stdexcept>
+#include <arpa/inet.h>
+
+/* Helper to safely retrieve VerbsTransport instance from C handle state pointer */
+static VerbsTransport* get_impl(pg_transport_t* transport) {
+    if (!transport || !transport->state) return nullptr;
+    return static_cast<VerbsTransport*>(transport->state);
+}
+
+static int verbs_rank(const pg_transport_t* transport) {
+    auto* self = static_cast<const VerbsTransport*>(transport->state);
+    return self ? self->get_rank() : -1;
+}
+
+static int verbs_size(const pg_transport_t* transport) {
+    auto* self = static_cast<const VerbsTransport*>(transport->state);
+    return self ? self->get_world_size() : -1;
+}
 
 /* Static C-Style Callbacks for pg_transport_ops_t Interoperability */
 
 static int verbs_post_send_next(pg_transport_t* transport, const void* buf, size_t bytes, 
                                 pg_tag_t tag, pg_transfer_mode_t mode, pg_request_t* req) {
-    if (!transport || !transport->impl) return -1;
-    auto* self = static_cast<VerbsTransport*>(transport->impl);
+    (void)mode;
+    (void)req;
+    VerbsTransport* self = get_impl(transport);
+    if (!self) return -1;
 
     try {
         // Register memory region for the outgoing buffer slice
@@ -34,14 +54,21 @@ static int verbs_post_send_next(pg_transport_t* transport, const void* buf, size
 
 static int verbs_post_recv_prev(pg_transport_t* transport, void* buf, size_t bytes, 
                                 pg_tag_t tag, pg_transfer_mode_t mode, pg_request_t* req) {
+    (void)transport;
+    (void)buf;
+    (void)bytes;
+    (void)tag;
+    (void)mode;
+    (void)req;
     // For RDMA Writes, incoming data is written directly into destination memory by the sender's NIC.
     // No explicit receive Work Request (WR) needs to be posted on the receiver side.
     return 0;
 }
 
 static int verbs_wait(pg_transport_t* transport, pg_request_t* req) {
-    if (!transport || !transport->impl) return -1;
-    auto* self = static_cast<VerbsTransport*>(transport->impl);
+    (void)req;
+    VerbsTransport* self = get_impl(transport);
+    if (!self) return -1;
 
     try {
         // Wait for incoming completion signal from previous node
@@ -74,10 +101,10 @@ VerbsTransport::VerbsTransport(int rank, int world_size, struct ibv_context* con
 
     // Bind transport instance references to C-style wrapper struct
     std::memset(&c_transport_, 0, sizeof(c_transport_));
-    c_transport_.operations = &c_ops_;
-    c_transport_.impl = this;
-    c_transport_.rank = rank_;
-    c_transport_.size = world_size_;
+    c_transport_.ops = &c_ops_;
+    c_transport_.state = this;
+    c_transport_.rank = verbs_rank;
+    c_transport_.size = verbs_size;
 }
 
 /* Destructor - Cleans up the Completion Queue (CQ) and any other resources allocated by the VerbsTransport. */

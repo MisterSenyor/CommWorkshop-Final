@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <cstddef>
 #include <stdexcept>
 
 /* Structure to hold remote memory region information for RDMA operations. */
@@ -35,8 +36,8 @@ public:
     // Returns a C-style transport structure for interoperability with C code.
     pg_transport_t* get_c_transport() { return &c_transport_; }
 
-    int rank() const { return rank_; }
-    int world_size() const { return world_size_; }
+    int get_rank() const { return rank_; }
+    int get_world_size() const { return world_size_; }
 
 private:
     int rank_; // The rank of the current process in the ring topology.
