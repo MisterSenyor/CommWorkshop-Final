@@ -8,11 +8,15 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 option(RING_BUILD_TESTS "Build the mock-transport test suite" ON)
 option(RING_BUILD_EXAMPLES "Build example programs" ON)
 
+# Find system InfiniBand Verbs library
+find_library(LIBVERBS_LIB ibverbs REQUIRED)
+
 add_library(ring_collectives
     src/block_layout.cpp
     src/reduction_ops.cpp
     src/ring_collectives.cpp
     src/process_group_api.cpp
+    src/verbs_transport.cpp 
 )
 
 target_include_directories(ring_collectives
@@ -23,6 +27,9 @@ target_include_directories(ring_collectives
 target_compile_options(ring_collectives PRIVATE
     -Wall -Wextra -Wpedantic
 )
+
+# Link InfiniBand Verbs library
+target_link_libraries(ring_collectives PUBLIC ${LIBVERBS_LIB})
 
 add_library(mock_transport
     src/mock_transport.cpp
