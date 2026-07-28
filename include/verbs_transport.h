@@ -38,6 +38,9 @@ public:
     // Returns a C-style transport structure for interoperability with C code.
     pg_transport_t* get_c_transport() { return &c_transport_; }
 
+    // Returns the internal Completion Queue handle required for QP creation.
+    struct ibv_cq* get_cq() const { return cq_; }
+
     int get_rank() const { return rank_; }
     int get_world_size() const { return world_size_; }
 

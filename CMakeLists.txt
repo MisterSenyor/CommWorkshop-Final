@@ -29,5 +29,9 @@ target_compile_options(ring_collectives PRIVATE
 # Link InfiniBand Verbs
 target_link_libraries(ring_collectives PUBLIC ${LIBVERBS_LIB})
 
-add_executable(test_runner src/test_runner.cpp)
+add_executable(test_runner tests/test_runner.cpp)
 target_link_libraries(test_runner PRIVATE ring_collectives ibverbs pthread)
+
+# Enable AddressSanitizer and Debug symbols for test_runner
+target_compile_options(test_runner PRIVATE -g -fsanitize=address -fno-omit-frame-pointer)
+target_link_options(test_runner PRIVATE -fsanitize=address)

@@ -10,6 +10,9 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <stdexcept>
+#include <vector>
+#include <string>
+#include <sstream>
 
 namespace {
 
@@ -79,6 +82,8 @@ namespace {
 
     /* Helper function to create an IBV Queue Pair */
     struct ibv_qp* create_qp(struct ibv_pd* pd, struct ibv_cq* cq) {
+        if (!pd || !cq) return nullptr;
+
         struct ibv_qp_init_attr qp_init_attr;
         std::memset(&qp_init_attr, 0, sizeof(qp_init_attr));
         qp_init_attr.send_cq = cq;
@@ -139,6 +144,23 @@ namespace {
         return sock;
     }
 
+    /* Helper function to extract ring topology hostnames from environment or fallback to servername */
+    std::vector<std::string> get_host_list(const char* servername, int world_size) {
+        std::vector<std::string> hosts;
+        if (const char* env_hosts = std::getenv("HOST_LIST")) {
+            std::stringstream ss(env_hosts);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                if (!item.empty()) hosts.push_back(item);
+            }
+        }
+        if (hosts.empty()) {
+            std::string base = (servername && std::strlen(servername) > 0) ? servername : "localhost";
+            hosts.assign(world_size, base);
+        }
+        return hosts;
+    }
+
 } // namespace
 
 /* Establishes a connection to the process group server, initializes the VerbsTransport, and creates a process group handle for collective operations. */
@@ -177,7 +199,7 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
 
         // Parse environment/arguments for rank and world size
         int rank = 0;
-        int world_size = 4;
+        int world_size = 1;
         if (const char* env_rank = std::getenv("RANK")) rank = std::atoi(env_rank);
         if (const char* env_size = std::getenv("WORLD_SIZE")) world_size = std::atoi(env_size);
 
@@ -193,11 +215,14 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
         uint64_t dummy_buf[64];
         struct ibv_mr* base_mr = verbs_transport->register_memory(dummy_buf, sizeof(dummy_buf));
 
-        // 3. Create Queue Pairs for ring neighbors
-        struct ibv_qp* qp_next = create_qp(pd, nullptr);
-        struct ibv_qp* qp_prev = create_qp(pd, nullptr);
+        // 3. Create Queue Pairs for ring neighbors using transport CQ
+        struct ibv_cq* cq = verbs_transport->get_cq();
+        struct ibv_qp* qp_next = create_qp(pd, cq);
+        struct ibv_qp* qp_prev = create_qp(pd, cq);
         if (!qp_next || !qp_prev) {
             verbs_transport->unregister_memory(base_mr);
+            if (qp_next) ibv_destroy_qp(qp_next);
+            if (qp_prev) ibv_destroy_qp(qp_prev);
             delete verbs_transport;
             return PG_ERR_TRANSPORT;
         }
@@ -210,13 +235,20 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
         int base_port = 18000;
         int next_sock = -1, prev_sock = -1;
 
+        // Determine ring neighbor ranks and target hostnames
+        int next_rank = (rank + 1) % world_size;
+        int prev_rank = (rank - 1 + world_size) % world_size;
+
+        std::vector<std::string> hosts = get_host_list(servername, world_size);
+        std::string next_host = hosts[next_rank % hosts.size()];
+
         // Symmetric ring connection sequence based on rank parity to prevent socket deadlocks
         if (rank % 2 == 0) {
-            next_sock = connect_to_host(servername ? servername : "localhost", base_port + rank);
-            prev_sock = listen_and_accept(base_port + ((rank - 1 + world_size) % world_size));
+            next_sock = connect_to_host(next_host.c_str(), base_port + rank);
+            prev_sock = listen_and_accept(base_port + prev_rank);
         } else {
-            prev_sock = listen_and_accept(base_port + ((rank - 1 + world_size) % world_size));
-            next_sock = connect_to_host(servername ? servername : "localhost", base_port + rank);
+            prev_sock = listen_and_accept(base_port + prev_rank);
+            next_sock = connect_to_host(next_host.c_str(), base_port + rank);
         }
 
         if (next_sock < 0 || prev_sock < 0) {
@@ -229,7 +261,7 @@ extern "C" int connect_process_group(char *servername, void **pg_handle) {
             return PG_ERR_TRANSPORT;
         }
 
-        // Perform bidirection struct transfers
+        // Perform bidirectional struct transfers
         write(next_sock, &local_next, sizeof(local_next));
         read(next_sock, &remote_next, sizeof(remote_next));
 
