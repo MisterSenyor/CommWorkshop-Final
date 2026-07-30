@@ -1,238 +1,596 @@
 #include "verbs_transport.h"
-#include <iostream>
-#include <cstring>
-#include <cassert>
-#include <stdexcept>
-#include <arpa/inet.h>
 
-/* Helper to safely retrieve VerbsTransport instance from C handle implementation pointer */
-static VerbsTransport* get_impl(pg_transport_t* transport) {
-    if (!transport || !transport->implementation) return nullptr;
+#include <arpa/inet.h>
+#include <unistd.h>
+
+#include <cerrno>
+#include <cstring>
+#include <iostream>
+#include <limits>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace {
+
+constexpr std::size_t kEagerThresholdBytes = 4U * 1024U;
+constexpr std::uint32_t kControlMagic = 0x52444d41U; // "RDMA"
+
+struct ControlMessage {
+    std::uint32_t magic;
+    std::uint32_t tag;
+    std::uint64_t remote_address;
+    std::uint32_t remote_key;
+    std::uint32_t bytes;
+    std::uint32_t mode;
+    std::uint32_t reserved;
+};
+
+static_assert(sizeof(ControlMessage) == 32U,
+              "ControlMessage must have a stable size");
+
+bool write_all(int socket_fd, const void* source, std::size_t bytes) {
+    const auto* current = static_cast<const std::byte*>(source);
+
+    while (bytes > 0U) {
+        const ssize_t written = ::write(socket_fd, current, bytes);
+        if (written < 0 && errno == EINTR) {
+            continue;
+        }
+        if (written <= 0) {
+            return false;
+        }
+
+        current += static_cast<std::size_t>(written);
+        bytes -= static_cast<std::size_t>(written);
+    }
+
+    return true;
+}
+
+bool read_all(int socket_fd, void* destination, std::size_t bytes) {
+    auto* current = static_cast<std::byte*>(destination);
+
+    while (bytes > 0U) {
+        const ssize_t received = ::read(socket_fd, current, bytes);
+        if (received < 0 && errno == EINTR) {
+            continue;
+        }
+        if (received <= 0) {
+            return false;
+        }
+
+        current += static_cast<std::size_t>(received);
+        bytes -= static_cast<std::size_t>(received);
+    }
+
+    return true;
+}
+
+VerbsTransport* implementation_of(pg_transport_t* transport) {
+    if (transport == nullptr || transport->implementation == nullptr) {
+        return nullptr;
+    }
     return static_cast<VerbsTransport*>(transport->implementation);
 }
 
-static int verbs_rank(const pg_transport_t* transport) {
-    if (!transport || !transport->implementation) return -1;
-    auto* self = static_cast<const VerbsTransport*>(transport->implementation);
-    return self ? self->get_rank() : -1;
+const VerbsTransport* implementation_of(const pg_transport_t* transport) {
+    if (transport == nullptr || transport->implementation == nullptr) {
+        return nullptr;
+    }
+    return static_cast<const VerbsTransport*>(transport->implementation);
 }
 
-static int verbs_size(const pg_transport_t* transport) {
-    if (!transport || !transport->implementation) return -1;
-    auto* self = static_cast<const VerbsTransport*>(transport->implementation);
-    return self ? self->get_world_size() : -1;
+int verbs_rank(const pg_transport_t* transport) {
+    const VerbsTransport* implementation = implementation_of(transport);
+    return implementation == nullptr ? -1 : implementation->get_rank();
 }
 
-/* Static C-Style Callbacks for pg_transport_ops_t Interoperability */
+int verbs_size(const pg_transport_t* transport) {
+    const VerbsTransport* implementation = implementation_of(transport);
+    return implementation == nullptr ? -1 : implementation->get_world_size();
+}
 
-static int verbs_post_send_next(pg_transport_t* transport, const void* buf, size_t bytes, 
-                                pg_tag_t tag, pg_transfer_mode_t mode, pg_request_t* req) {
-    (void)mode;
-    (void)req;
-    VerbsTransport* self = get_impl(transport);
-    if (!self) return -1;
+int verbs_post_send_next(pg_transport_t* transport,
+                         const void* buffer,
+                         std::size_t bytes,
+                         pg_tag_t tag,
+                         pg_transfer_mode_t mode,
+                         pg_request_t* request) {
+    VerbsTransport* implementation = implementation_of(transport);
+    if (implementation == nullptr) {
+        return -1;
+    }
 
     try {
-        // Send via RDMA Write with Immediate (tag is sent as imm_data)
-        self->post_rdma_write_imm(
-            const_cast<void*>(buf), 
-            bytes, 
-            nullptr, 
-            0, 
-            static_cast<uint32_t>(tag)
-        );
+        implementation->post_send_next(buffer, bytes, tag, mode, request);
         return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "[VerbsTransport] Error in post_send_next: " << e.what() << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "[VerbsTransport] post_send_next failed: "
+                  << error.what() << std::endl;
         return -1;
     }
 }
 
-static int verbs_post_recv_prev(pg_transport_t* transport, void* buf, size_t bytes, 
-                                pg_tag_t tag, pg_transfer_mode_t mode, pg_request_t* req) {
-    (void)buf;
-    (void)bytes;
-    (void)tag;
-    (void)mode;
-    (void)req;
-    VerbsTransport* self = get_impl(transport);
-    if (!self) return -1;
+int verbs_post_recv_prev(pg_transport_t* transport,
+                         void* buffer,
+                         std::size_t bytes,
+                         pg_tag_t tag,
+                         pg_transfer_mode_t mode,
+                         pg_request_t* request) {
+    VerbsTransport* implementation = implementation_of(transport);
+    if (implementation == nullptr) {
+        return -1;
+    }
 
     try {
-        // Post a receive Work Request to qp_prev_ to catch the incoming immediate notification
-        self->post_recv_imm();
+        implementation->post_receive_previous(buffer, bytes, tag, mode, request);
         return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "[VerbsTransport] Error in post_recv_prev: " << e.what() << std::endl;
+    } catch (const std::exception& error) {
+        std::cerr << "[VerbsTransport] post_recv_prev failed: "
+                  << error.what() << std::endl;
         return -1;
     }
 }
 
-static int verbs_wait(pg_transport_t* transport, pg_request_t* req) {
-    (void)req;
-    VerbsTransport* self = get_impl(transport);
-    if (!self) return -1;
+int verbs_test(pg_transport_t* transport,
+               pg_request_t* request,
+               int* completed) {
+    VerbsTransport* implementation = implementation_of(transport);
+    if (implementation == nullptr) {
+        return -1;
+    }
 
     try {
-        // Wait for incoming completion signal from previous node
-        self->poll_completion_imm();
-        return 0;
-    } catch (const std::exception& e) {
-        std::cerr << "[VerbsTransport] Error in wait: " << e.what() << std::endl;
+        return implementation->test_request(request, completed);
+    } catch (const std::exception& error) {
+        std::cerr << "[VerbsTransport] test failed: "
+                  << error.what() << std::endl;
         return -1;
     }
 }
 
-/* Constructor - Initializes the VerbsTransport with the given rank, world size, InfiniBand context, and protection domain. It also creates a Completion Queue (CQ) for handling work completions and binds C-style operations. */
-VerbsTransport::VerbsTransport(int rank, int world_size, struct ibv_context* context, struct ibv_pd* pd)
-    : rank_(rank), world_size_(world_size), context_(context), pd_(pd) {
-    if (!context_ || !pd_) {
-        throw std::runtime_error("Invalid Verbs context or protection domain provided.");
+int verbs_wait(pg_transport_t* transport, pg_request_t* request) {
+    VerbsTransport* implementation = implementation_of(transport);
+    if (implementation == nullptr) {
+        return -1;
     }
 
-    // Create a Completion Queue (CQ) capable of holding completion elements
-    cq_ = ibv_create_cq(context_, 1024, nullptr, nullptr, 0);
-    if (!cq_) {
-        throw std::runtime_error("Failed to create IBV Completion Queue (CQ).");
+    try {
+        return implementation->wait_request(request);
+    } catch (const std::exception& error) {
+        std::cerr << "[VerbsTransport] wait failed: "
+                  << error.what() << std::endl;
+        return -1;
+    }
+}
+
+int verbs_progress(pg_transport_t* transport) {
+    VerbsTransport* implementation = implementation_of(transport);
+    if (implementation == nullptr) {
+        return -1;
     }
 
-    // Configure operations table for C-style pg_transport_t interface
-    std::memset(&c_ops_, 0, sizeof(c_ops_));
-    c_ops_.rank = verbs_rank;
-    c_ops_.size = verbs_size;
-    c_ops_.post_send_next = verbs_post_send_next;
-    c_ops_.post_recv_prev = verbs_post_recv_prev;
-    c_ops_.wait = verbs_wait;
+    try {
+        return implementation->progress();
+    } catch (const std::exception& error) {
+        std::cerr << "[VerbsTransport] progress failed: "
+                  << error.what() << std::endl;
+        return -1;
+    }
+}
 
-    // Bind transport instance references to C-style wrapper struct
-    std::memset(&c_transport_, 0, sizeof(c_transport_));
+void verbs_destroy(pg_transport_t* transport) {
+    VerbsTransport* implementation = implementation_of(transport);
+    delete implementation;
+}
+
+} // namespace
+
+VerbsTransport::VerbsTransport(int rank,
+                               int world_size,
+                               struct ibv_context* context,
+                               struct ibv_pd* pd)
+    : rank_(rank),
+      world_size_(world_size),
+      context_(context),
+      pd_(pd) {
+    if (rank_ < 0 || world_size_ <= 0 || rank_ >= world_size_ ||
+        context_ == nullptr || pd_ == nullptr) {
+        throw std::runtime_error("Invalid VerbsTransport constructor arguments");
+    }
+
+    cq_ = ibv_create_cq(context_, 2048, nullptr, nullptr, 0);
+    if (cq_ == nullptr) {
+        throw std::runtime_error("ibv_create_cq failed");
+    }
+
+    c_operations_.rank = verbs_rank;
+    c_operations_.size = verbs_size;
+    c_operations_.post_send_next = verbs_post_send_next;
+    c_operations_.post_recv_prev = verbs_post_recv_prev;
+    c_operations_.test = verbs_test;
+    c_operations_.wait = verbs_wait;
+    c_operations_.progress = verbs_progress;
+    c_operations_.destroy = verbs_destroy;
+
     c_transport_.implementation = this;
-    c_transport_.operations = &c_ops_;
+    c_transport_.operations = &c_operations_;
 }
 
-/* Destructor - Cleans up the Completion Queue (CQ) and any other resources allocated by the VerbsTransport. */
 VerbsTransport::~VerbsTransport() {
-    if (cq_) {
+    if (next_socket_ >= 0) {
+        ::close(next_socket_);
+        next_socket_ = -1;
+    }
+    if (previous_socket_ >= 0) {
+        ::close(previous_socket_);
+        previous_socket_ = -1;
+    }
+
+    // Destroy QPs before deregistering memory used by outstanding WRs.
+    if (qp_next_ != nullptr) {
+        ibv_destroy_qp(qp_next_);
+        qp_next_ = nullptr;
+    }
+    if (qp_prev_ != nullptr) {
+        ibv_destroy_qp(qp_prev_);
+        qp_prev_ = nullptr;
+    }
+
+    for (RequestState* request : pending_requests_) {
+        if (request->memory_region != nullptr) {
+            ibv_dereg_mr(request->memory_region);
+        }
+        delete request;
+    }
+    pending_requests_.clear();
+
+    if (cq_ != nullptr) {
         ibv_destroy_cq(cq_);
+        cq_ = nullptr;
+    }
+    if (pd_ != nullptr) {
+        ibv_dealloc_pd(pd_);
+        pd_ = nullptr;
+    }
+    if (context_ != nullptr) {
+        ibv_close_device(context_);
+        context_ = nullptr;
     }
 }
 
-/* Registers a local memory buffer with the InfiniBand NIC, allowing it to be used for RDMA operations. Returns a pointer to the registered memory region (ibv_mr). */
-struct ibv_mr* VerbsTransport::register_memory(void* addr, size_t length) {
-    int access_flags = IBV_ACCESS_LOCAL_WRITE | 
-                       IBV_ACCESS_REMOTE_WRITE | 
-                       IBV_ACCESS_REMOTE_READ;
-
-    struct ibv_mr* mr = ibv_reg_mr(pd_, addr, length, access_flags);
-    if (!mr) {
-        throw std::runtime_error("ibv_reg_mr failed: Unable to register memory region.");
+void VerbsTransport::set_ring_qps(struct ibv_qp* qp_next,
+                                  struct ibv_qp* qp_prev) {
+    if (qp_next == nullptr || qp_prev == nullptr) {
+        throw std::runtime_error("Both ring QPs must be non-null");
     }
-    return mr;
-}
-
-/* Unregisters a previously registered memory region, freeing it from the InfiniBand NIC. */
-void VerbsTransport::unregister_memory(struct ibv_mr* mr) {
-    if (mr) {
-        ibv_dereg_mr(mr);
-    }
-}
-
-/* Sets the ring topology by configuring the next and previous Queue Pairs (QPs) for RDMA communication. */
-void VerbsTransport::set_ring_qps(struct ibv_qp* qp_next, struct ibv_qp* qp_prev) {
     qp_next_ = qp_next;
     qp_prev_ = qp_prev;
 }
 
-/* Sets the remote memory region information for the next node in the ring, allowing RDMA writes to target the correct remote buffer. */
-void VerbsTransport::set_remote_mr_next(const RemoteMR& remote_mr) {
-    remote_mr_next_ = remote_mr;
+void VerbsTransport::set_control_sockets(int next_socket,
+                                         int previous_socket) {
+    if (next_socket < 0 || previous_socket < 0) {
+        throw std::runtime_error("Both control sockets must be valid");
+    }
+    next_socket_ = next_socket;
+    previous_socket_ = previous_socket;
 }
 
-/* Posts a Receive Work Request on the previous Queue Pair to consume the incoming immediate data. */
-void VerbsTransport::post_recv_imm() {
-    assert(qp_prev_ != nullptr && "qp_prev must be configured before posting Recv");
+pg_transfer_mode_t VerbsTransport::choose_mode(
+    pg_transfer_mode_t requested_mode,
+    std::size_t bytes) const {
+    if (requested_mode == PG_TRANSFER_EAGER ||
+        requested_mode == PG_TRANSFER_RENDEZVOUS) {
+        return requested_mode;
+    }
+    if (requested_mode != PG_TRANSFER_AUTO) {
+        throw std::runtime_error("Unsupported transfer mode");
+    }
 
-    struct ibv_recv_wr wr;
-    std::memset(&wr, 0, sizeof(wr));
-    wr.wr_id = 2; // Arbitrary receive WR ID
-    wr.sg_list = nullptr;
-    wr.num_sge = 0;
+    return bytes <= kEagerThresholdBytes
+               ? PG_TRANSFER_EAGER
+               : PG_TRANSFER_RENDEZVOUS;
+}
 
-    struct ibv_recv_wr* bad_wr = nullptr;
-    int ret = ibv_post_recv(qp_prev_, &wr, &bad_wr);
-    if (ret != 0) {
-        throw std::runtime_error("ibv_post_recv failed with error code: " + std::to_string(ret));
+struct ibv_mr* VerbsTransport::register_memory(void* address,
+                                                std::size_t length,
+                                                int access_flags) {
+    if (address == nullptr || length == 0U) {
+        throw std::runtime_error("Cannot register an empty buffer");
+    }
+
+    struct ibv_mr* memory_region =
+        ibv_reg_mr(pd_, address, length, access_flags);
+    if (memory_region == nullptr) {
+        throw std::runtime_error(
+            "ibv_reg_mr failed: " + std::string(std::strerror(errno)));
+    }
+    return memory_region;
+}
+
+void VerbsTransport::post_receive_previous(
+    void* buffer,
+    std::size_t bytes,
+    pg_tag_t tag,
+    pg_transfer_mode_t requested_mode,
+    pg_request_t* request) {
+    if (qp_prev_ == nullptr || previous_socket_ < 0 ||
+        buffer == nullptr || bytes == 0U || request == nullptr ||
+        request->internal != nullptr) {
+        throw std::runtime_error("Invalid receive request");
+    }
+    if (bytes > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("Receive request is too large");
+    }
+
+    const pg_transfer_mode_t mode = choose_mode(requested_mode, bytes);
+    const int access_flags =
+        IBV_ACCESS_LOCAL_WRITE |
+        (mode == PG_TRANSFER_RENDEZVOUS ? IBV_ACCESS_REMOTE_WRITE : 0);
+
+    struct ibv_mr* memory_region =
+        register_memory(buffer, bytes, access_flags);
+
+    auto* state = new RequestState();
+    state->kind = RequestKind::Receive;
+    state->id = next_request_id_++;
+    state->tag = tag;
+    state->mode = mode;
+    state->memory_region = memory_region;
+    pending_requests_.insert(state);
+
+    struct ibv_sge scatter_gather{};
+    struct ibv_recv_wr work_request{};
+    work_request.wr_id = reinterpret_cast<std::uint64_t>(state);
+
+    if (mode == PG_TRANSFER_EAGER) {
+        scatter_gather.addr = reinterpret_cast<std::uint64_t>(buffer);
+        scatter_gather.length = static_cast<std::uint32_t>(bytes);
+        scatter_gather.lkey = memory_region->lkey;
+        work_request.sg_list = &scatter_gather;
+        work_request.num_sge = 1;
+    }
+
+    struct ibv_recv_wr* bad_work_request = nullptr;
+    const int post_status =
+        ibv_post_recv(qp_prev_, &work_request, &bad_work_request);
+    if (post_status != 0) {
+        pending_requests_.erase(state);
+        ibv_dereg_mr(memory_region);
+        delete state;
+        throw std::runtime_error(
+            "ibv_post_recv failed with code " +
+            std::to_string(post_status));
+    }
+
+    request->id = state->id;
+    request->internal = state;
+
+    const ControlMessage control{
+        kControlMagic,
+        tag,
+        reinterpret_cast<std::uint64_t>(buffer),
+        memory_region->rkey,
+        static_cast<std::uint32_t>(bytes),
+        static_cast<std::uint32_t>(mode),
+        0U,
+    };
+
+    // The previous rank is the sender for this receive request.
+    if (!write_all(previous_socket_, &control, sizeof(control))) {
+        throw std::runtime_error(
+            "Failed to send rendezvous descriptor to previous rank");
     }
 }
 
-/* Posts an RDMA Write with Immediate operation to the next node in the ring. The local buffer is written to the remote buffer, and an immediate value is sent to signal completion. */
-void VerbsTransport::post_rdma_write_imm(void* local_addr, size_t length, struct ibv_mr* local_mr,
-                                          uint64_t remote_offset, uint32_t imm_data) {
-
-    // Ensure that the next Queue Pair (QP) is configured before posting the RDMA Write operation
-    assert(qp_next_ != nullptr && "qp_next must be configured before posting RDMA Write");
-
-    // Prepare the Scatter/Gather Element (SGE) for the local buffer
-    struct ibv_sge sge;
-    std::memset(&sge, 0, sizeof(sge));
-    sge.addr = reinterpret_cast<uint64_t>(local_addr);
-    sge.length = static_cast<uint32_t>(length);
-    sge.lkey = local_mr ? local_mr->lkey : 0;
-
-    // Prepare the Work Request (WR) for the RDMA Write with Immediate operation
-    struct ibv_send_wr wr;
-    std::memset(&wr, 0, sizeof(wr));
-    wr.wr_id = 1; // Arbitrary work request ID
-    wr.sg_list = &sge;
-    wr.num_sge = 1;
-    wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM; // Critical for completion signaling
-    wr.send_flags = IBV_SEND_SIGNALED;      // Triggers completion entry on local CQ
-    wr.imm_data = htonl(imm_data);           // Transmit immediate value in Network Byte Order
-
-    // Set the remote address and remote key for the RDMA Write operation
-    wr.wr.rdma.remote_addr = remote_mr_next_.vaddr + remote_offset;
-    wr.wr.rdma.rkey = remote_mr_next_.rkey;
-
-    // Post the Work Request to the next Queue Pair (QP) for execution
-    struct ibv_send_wr* bad_wr = nullptr;
-    int ret = ibv_post_send(qp_next_, &wr, &bad_wr);
-    if (ret != 0) {
-        throw std::runtime_error("ibv_post_send failed with error code: " + std::to_string(ret));
+void VerbsTransport::post_send_next(
+    const void* buffer,
+    std::size_t bytes,
+    pg_tag_t tag,
+    pg_transfer_mode_t requested_mode,
+    pg_request_t* request) {
+    if (qp_next_ == nullptr || next_socket_ < 0 ||
+        buffer == nullptr || bytes == 0U || request == nullptr ||
+        request->internal != nullptr) {
+        throw std::runtime_error("Invalid send request");
     }
+    if (bytes > std::numeric_limits<std::uint32_t>::max()) {
+        throw std::runtime_error("Send request is too large");
+    }
+
+    const pg_transfer_mode_t mode = choose_mode(requested_mode, bytes);
+
+    ControlMessage control{};
+    if (!read_all(next_socket_, &control, sizeof(control))) {
+        throw std::runtime_error(
+            "Failed to receive rendezvous descriptor from next rank");
+    }
+
+    if (control.magic != kControlMagic || control.tag != tag ||
+        control.bytes != bytes ||
+        control.mode != static_cast<std::uint32_t>(mode)) {
+        throw std::runtime_error(
+            "Control descriptor mismatch: expected tag=" +
+            std::to_string(tag) + " bytes=" + std::to_string(bytes) +
+            " mode=" + std::to_string(static_cast<unsigned>(mode)) +
+            ", received tag=" + std::to_string(control.tag) +
+            " bytes=" + std::to_string(control.bytes) +
+            " mode=" + std::to_string(control.mode));
+    }
+
+    struct ibv_mr* memory_region =
+        register_memory(const_cast<void*>(buffer), bytes, 0);
+
+    auto* state = new RequestState();
+    state->kind = RequestKind::Send;
+    state->id = next_request_id_++;
+    state->tag = tag;
+    state->mode = mode;
+    state->memory_region = memory_region;
+    pending_requests_.insert(state);
+
+    struct ibv_sge scatter_gather{};
+    scatter_gather.addr = reinterpret_cast<std::uint64_t>(buffer);
+    scatter_gather.length = static_cast<std::uint32_t>(bytes);
+    scatter_gather.lkey = memory_region->lkey;
+
+    struct ibv_send_wr work_request{};
+    work_request.wr_id = reinterpret_cast<std::uint64_t>(state);
+    work_request.sg_list = &scatter_gather;
+    work_request.num_sge = 1;
+    work_request.send_flags = IBV_SEND_SIGNALED;
+    work_request.imm_data = htonl(tag);
+
+    if (mode == PG_TRANSFER_EAGER) {
+        work_request.opcode = IBV_WR_SEND_WITH_IMM;
+    } else {
+        work_request.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+        work_request.wr.rdma.remote_addr = control.remote_address;
+        work_request.wr.rdma.rkey = control.remote_key;
+    }
+
+    struct ibv_send_wr* bad_work_request = nullptr;
+    const int post_status =
+        ibv_post_send(qp_next_, &work_request, &bad_work_request);
+    if (post_status != 0) {
+        pending_requests_.erase(state);
+        ibv_dereg_mr(memory_region);
+        delete state;
+        throw std::runtime_error(
+            "ibv_post_send failed with code " +
+            std::to_string(post_status));
+    }
+
+    request->id = state->id;
+    request->internal = state;
 }
 
-/* Polls the Completion Queue (CQ) for incoming work completions, specifically looking for RDMA Write with Immediate completions. Returns the immediate value which was sent by the previous node in the ring. */
-uint32_t VerbsTransport::poll_completion_imm() {
+void VerbsTransport::handle_completion(const struct ibv_wc& completion) {
+    auto* state = reinterpret_cast<RequestState*>(completion.wr_id);
+    if (state == nullptr || pending_requests_.find(state) == pending_requests_.end()) {
+        throw std::runtime_error("Completion contained an unknown wr_id");
+    }
 
-    // Prepare a Work Completion (WC) structure to hold the completion details
-    struct ibv_wc wc;
-    std::memset(&wc, 0, sizeof(wc));
+    if (completion.status != IBV_WC_SUCCESS) {
+        std::cerr << "[Rank " << rank_ << "] WR id=" << state->id
+                  << " tag=" << state->tag
+                  << " failed: " << ibv_wc_status_str(completion.status)
+                  << " vendor_err=" << completion.vendor_err << std::endl;
+        state->status = -1;
+        state->completed = true;
+        return;
+    }
 
-    // Continuously poll the Completion Queue (CQ) until a valid completion is received
+    if (state->kind == RequestKind::Send) {
+        const bool valid_opcode =
+            (state->mode == PG_TRANSFER_EAGER &&
+             completion.opcode == IBV_WC_SEND) ||
+            (state->mode == PG_TRANSFER_RENDEZVOUS &&
+             completion.opcode == IBV_WC_RDMA_WRITE);
+        if (!valid_opcode) {
+            state->status = -1;
+        }
+    } else {
+        const bool valid_opcode =
+            (state->mode == PG_TRANSFER_EAGER &&
+             completion.opcode == IBV_WC_RECV) ||
+            (state->mode == PG_TRANSFER_RENDEZVOUS &&
+             completion.opcode == IBV_WC_RECV_RDMA_WITH_IMM);
+
+        if (!valid_opcode ||
+            (completion.wc_flags & IBV_WC_WITH_IMM) == 0 ||
+            ntohl(completion.imm_data) != state->tag) {
+            state->status = -1;
+        }
+    }
+
+    state->completed = true;
+}
+
+void VerbsTransport::poll_one_blocking() {
     while (true) {
-        
-        // Poll the CQ for a single completion entry
-        int ne = ibv_poll_cq(cq_, 1, &wc);
-        if (ne < 0) {
-            throw std::runtime_error("ibv_poll_cq failed while waiting for completion.");
+        struct ibv_wc completion{};
+        const int count = ibv_poll_cq(cq_, 1, &completion);
+        if (count < 0) {
+            throw std::runtime_error("ibv_poll_cq failed");
         }
-        
-        // If a completion entry is received, check its status and opcode
-        if (ne > 0) {
-            if (wc.status != IBV_WC_SUCCESS) {
-                throw std::runtime_error("Work Completion failed with status: " + 
-                                         std::string(ibv_wc_status_str(wc.status)));
-            }
-
-            // If the completion is for an RDMA Write with Immediate, return the immediate value which was sent by the previous node in the ring
-            if (wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
-                return ntohl(wc.imm_data); // Return chunk identifier or flag
-            }
-
-            // If the completion is not for an RDMA Write with Immediate, continue polling for the next completion
-            if (wc.opcode == IBV_WC_RDMA_WRITE) {
-                continue; 
-            }
+        if (count == 1) {
+            handle_completion(completion);
+            return;
         }
+        std::this_thread::yield();
     }
+}
+
+int VerbsTransport::poll_available() {
+    int processed = 0;
+    while (true) {
+        struct ibv_wc completions[16]{};
+        const int count = ibv_poll_cq(cq_, 16, completions);
+        if (count < 0) {
+            throw std::runtime_error("ibv_poll_cq failed");
+        }
+        if (count == 0) {
+            return processed;
+        }
+        for (int index = 0; index < count; ++index) {
+            handle_completion(completions[index]);
+        }
+        processed += count;
+    }
+}
+
+void VerbsTransport::consume_request(pg_request_t* request) {
+    auto* state = static_cast<RequestState*>(request->internal);
+    if (state->memory_region != nullptr) {
+        ibv_dereg_mr(state->memory_region);
+        state->memory_region = nullptr;
+    }
+    pending_requests_.erase(state);
+    delete state;
+    request->id = 0;
+    request->internal = nullptr;
+}
+
+int VerbsTransport::test_request(pg_request_t* request, int* completed) {
+    if (request == nullptr || request->internal == nullptr || completed == nullptr) {
+        return -1;
+    }
+
+    auto* state = static_cast<RequestState*>(request->internal);
+    if (pending_requests_.find(state) == pending_requests_.end()) {
+        return -1;
+    }
+
+    if (!state->completed) {
+        poll_available();
+    }
+    *completed = state->completed ? 1 : 0;
+    return 0;
+}
+
+int VerbsTransport::wait_request(pg_request_t* request) {
+    if (request == nullptr || request->internal == nullptr) {
+        return -1;
+    }
+
+    auto* state = static_cast<RequestState*>(request->internal);
+    if (pending_requests_.find(state) == pending_requests_.end()) {
+        return -1;
+    }
+
+    while (!state->completed) {
+        poll_one_blocking();
+    }
+
+    const int status = state->status;
+    consume_request(request);
+    return status;
+}
+
+int VerbsTransport::progress() {
+    poll_available();
+    return 0;
 }

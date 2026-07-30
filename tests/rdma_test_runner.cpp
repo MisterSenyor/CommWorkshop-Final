@@ -182,6 +182,23 @@ int main(int argc, char** argv) {
             },
             0.0);
 
+        all_passed &= run_case<std::int32_t>(
+            handle,
+            rank,
+            "int32-sum-large-rendezvous",
+            32768,
+            PG_INT32,
+            PG_SUM,
+            false,
+            [](int r, int i) {
+                return static_cast<std::int32_t>((r + 1) * 10 + (i % 97));
+            },
+            [world_size, sum_ranks](int i) {
+                return static_cast<std::int32_t>(
+                    10 * sum_ranks + world_size * (i % 97));
+            },
+            0.0);
+
         all_passed &= run_case<float>(
             handle,
             rank,

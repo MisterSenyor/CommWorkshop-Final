@@ -2,64 +2,95 @@
 #define VERBS_TRANSPORT_H
 
 #include "pg_transport.h"
+
 #include <infiniband/verbs.h>
-#include <string>
-#include <vector>
-#include <cstdint>
+
 #include <cstddef>
-#include <stdexcept>
+#include <cstdint>
+#include <unordered_set>
 
-/* Structure to hold remote memory region information for RDMA operations. */
-struct RemoteMR {
-    uint64_t vaddr;
-    uint32_t rkey;
-};
-
-/* VerbsTransport class encapsulates the InfiniBand Verbs API for RDMA communication in a ring topology.
- It provides methods for memory registration, posting RDMA Write with Immediate operations, and polling for completions. */
 class VerbsTransport {
 public:
-    VerbsTransport(int rank, int world_size, struct ibv_context* context, struct ibv_pd* pd);
+    VerbsTransport(int rank,
+                   int world_size,
+                   struct ibv_context* context,
+                   struct ibv_pd* pd);
     ~VerbsTransport();
 
-    struct ibv_mr* register_memory(void* addr, size_t length);
-    void unregister_memory(struct ibv_mr* mr);
+    VerbsTransport(const VerbsTransport&) = delete;
+    VerbsTransport& operator=(const VerbsTransport&) = delete;
 
     void set_ring_qps(struct ibv_qp* qp_next, struct ibv_qp* qp_prev);
-    void set_remote_mr_next(const RemoteMR& remote_mr);
+    void set_control_sockets(int next_socket, int previous_socket);
 
-    void post_rdma_write_imm(void* local_addr, size_t length, struct ibv_mr* local_mr,
-                             uint64_t remote_offset, uint32_t imm_data);
+    void post_send_next(const void* buffer,
+                        std::size_t bytes,
+                        pg_tag_t tag,
+                        pg_transfer_mode_t requested_mode,
+                        pg_request_t* request);
 
-    void post_recv_imm();
+    void post_receive_previous(void* buffer,
+                               std::size_t bytes,
+                               pg_tag_t tag,
+                               pg_transfer_mode_t requested_mode,
+                               pg_request_t* request);
 
-    uint32_t poll_completion_imm();
+    int test_request(pg_request_t* request, int* completed);
+    int wait_request(pg_request_t* request);
+    int progress();
 
-    // Returns a C-style transport structure for interoperability with C code.
     pg_transport_t* get_c_transport() { return &c_transport_; }
-
-    // Returns the internal Completion Queue handle required for QP creation.
     struct ibv_cq* get_cq() const { return cq_; }
 
     int get_rank() const { return rank_; }
     int get_world_size() const { return world_size_; }
 
 private:
-    int rank_; // The rank of the current process in the ring topology.
-    int world_size_; // The total number of processes in the ring topology.
+    enum class RequestKind {
+        Send,
+        Receive,
+    };
 
-    struct ibv_context* context_{nullptr};
-    struct ibv_pd* pd_{nullptr}; // Protection Domain for memory registration and QP creation.
-    struct ibv_cq* cq_{nullptr}; // Completion Queue for handling work completions.
+    struct RequestState {
+        RequestKind kind = RequestKind::Send;
+        std::uint64_t id = 0;
+        pg_tag_t tag = 0;
+        pg_transfer_mode_t mode = PG_TRANSFER_AUTO;
+        struct ibv_mr* memory_region = nullptr;
+        bool completed = false;
+        int status = 0;
+    };
 
-    struct ibv_qp* qp_next_{nullptr}; // Next Queue Pair in the ring.
-    struct ibv_qp* qp_prev_{nullptr}; // Previous Queue Pair in the ring.
+    pg_transfer_mode_t choose_mode(pg_transfer_mode_t requested_mode,
+                                   std::size_t bytes) const;
 
-    RemoteMR remote_mr_next_{0, 0}; // Remote memory region information for the next node in the ring.
+    struct ibv_mr* register_memory(void* address,
+                                   std::size_t length,
+                                   int access_flags);
 
-    // C-style transport structure and operations for interoperability with C code.
-    pg_transport_t c_transport_;
-    pg_transport_ops_t c_ops_;
+    void poll_one_blocking();
+    int poll_available();
+    void handle_completion(const struct ibv_wc& completion);
+    void consume_request(pg_request_t* request);
+
+    int rank_;
+    int world_size_;
+
+    struct ibv_context* context_ = nullptr;
+    struct ibv_pd* pd_ = nullptr;
+    struct ibv_cq* cq_ = nullptr;
+
+    struct ibv_qp* qp_next_ = nullptr;
+    struct ibv_qp* qp_prev_ = nullptr;
+
+    int next_socket_ = -1;
+    int previous_socket_ = -1;
+
+    std::uint64_t next_request_id_ = 1;
+    std::unordered_set<RequestState*> pending_requests_;
+
+    pg_transport_t c_transport_{};
+    pg_transport_ops_t c_operations_{};
 };
 
-#endif // VERBS_TRANSPORT_H
+#endif
