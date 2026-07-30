@@ -10,7 +10,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <new>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -190,6 +192,40 @@ int connect_to_host(const char* host, int port) {
 
     freeaddrinfo(result);
     return connection;
+}
+
+
+int parse_positive_environment_int(const char* name, int default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || *value == '\0') {
+        return default_value;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const long parsed = std::strtol(value, &end, 10);
+    if (errno != 0 || end == value || *end != '\0' ||
+        parsed <= 0 || parsed > std::numeric_limits<int>::max()) {
+        throw std::runtime_error(std::string("Invalid ") + name +
+                                 " value: " + value);
+    }
+    return static_cast<int>(parsed);
+}
+
+pg_transfer_mode_t parse_transfer_mode_environment() {
+    const char* value = std::getenv("PG_TRANSFER_MODE");
+    if (value == nullptr || *value == '\0' ||
+        std::strcmp(value, "auto") == 0) {
+        return PG_TRANSFER_AUTO;
+    }
+    if (std::strcmp(value, "eager") == 0) {
+        return PG_TRANSFER_EAGER;
+    }
+    if (std::strcmp(value, "rendezvous") == 0) {
+        return PG_TRANSFER_RENDEZVOUS;
+    }
+    throw std::runtime_error(std::string("Invalid PG_TRANSFER_MODE value: ") +
+                             value);
 }
 
 std::vector<std::string> get_host_list(const char* servername,
@@ -412,9 +448,35 @@ extern "C" int connect_process_group(char* servername, void** pg_handle) {
     // descriptors. The bulk data still moves through InfiniBand.
     verbs_transport->set_control_sockets(next_socket, previous_socket);
 
+    ring_collective_config_t collective_config{};
+    try {
+        collective_config.pipeline_piece_bytes =
+            static_cast<std::size_t>(parse_positive_environment_int(
+                "PG_PIPELINE_PIECE_BYTES", 64 * 1024));
+        collective_config.max_inflight =
+            static_cast<unsigned int>(parse_positive_environment_int(
+                "PG_MAX_INFLIGHT", 4));
+        collective_config.transfer_mode = parse_transfer_mode_environment();
+    } catch (const std::exception& error) {
+        delete verbs_transport;
+        std::cerr << "Invalid collective configuration: "
+                  << error.what() << std::endl;
+        return PG_ERR_INVALID_ARGUMENT;
+    }
+
+    std::cerr << "[Rank " << rank << "] collective config: mode="
+              << (collective_config.transfer_mode == PG_TRANSFER_EAGER
+                      ? "eager"
+                      : collective_config.transfer_mode == PG_TRANSFER_RENDEZVOUS
+                            ? "rendezvous"
+                            : "auto")
+              << " piece_bytes=" << collective_config.pipeline_piece_bytes
+              << " max_inflight=" << collective_config.max_inflight
+              << std::endl;
+
     pg_transport_t* transport = verbs_transport->get_c_transport();
     const int status =
-        pg_create_from_transport(transport, 1, nullptr, pg_handle);
+        pg_create_from_transport(transport, 1, &collective_config, pg_handle);
     if (status != PG_SUCCESS) {
         delete verbs_transport;
         return status;

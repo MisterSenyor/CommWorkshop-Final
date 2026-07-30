@@ -2,7 +2,7 @@ LOCAL_BUILD_DIR ?= build-local
 RDMA_BUILD_DIR ?= build-rdma
 BUILD_TYPE ?= Debug
 
-.PHONY: all local-build local-test sanitize rdma-build test-2 test-4 clean
+.PHONY: all local-build local-test sanitize rdma-build test-2 test-4 benchmark-2 benchmark-4 clean
 
 all: local-test
 
@@ -23,10 +23,16 @@ rdma-build:
 	cmake --build $(RDMA_BUILD_DIR) -j
 
 test-2: rdma-build
-	./scripts/run_2_processes.sh "$$(pwd)"
+	bash ./scripts/run_2_processes.sh "$$(pwd)"
 
 test-4: rdma-build
-	./scripts/run_4_processes.sh "$$(pwd)"
+	bash ./scripts/run_4_processes.sh "$$(pwd)"
+
+benchmark-2: rdma-build
+	bash ./scripts/run_protocol_benchmark_2.sh "$$(pwd)"
+
+benchmark-4: rdma-build
+	bash ./scripts/run_protocol_benchmark_4.sh "$$(pwd)"
 
 clean:
 	rm -rf $(LOCAL_BUILD_DIR) $(LOCAL_BUILD_DIR)-san $(RDMA_BUILD_DIR) logs/*.log

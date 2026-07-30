@@ -73,6 +73,16 @@ if(BUILD_RDMA)
         target_compile_options(rdma_test_runner PRIVATE
             -Wall -Wextra -Wpedantic
         )
+
+        add_executable(rdma_protocol_benchmark
+            tests/rdma_protocol_benchmark.cpp
+        )
+        target_link_libraries(rdma_protocol_benchmark PRIVATE
+            ring_allreduce_rdma pthread
+        )
+        target_compile_options(rdma_protocol_benchmark PRIVATE
+            -Wall -Wextra -Wpedantic
+        )
     else()
         message(WARNING
             "libibverbs headers/library were not found. "
